@@ -329,6 +329,59 @@ the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
 
 ### Practical SSD streaming examples
 
+On a 24GB M4 Pro, use the current Flash q2-imatrix GGUF with an exact
+896-expert cache and a 1K prefill chunk. This profile keeps a 32K context while
+leaving enough of Metal's recommended working set for mapped non-routed
+weights and graph allocations:
+
+```sh
+./download_model.sh ds4f-q2
+make -j8
+
+./run-deepseek-flash-m4pro-24gb.sh
+```
+
+The equivalent command, useful when changing individual options, is:
+
+```sh
+./ds4 \
+  -m ./ds4flash.gguf \
+  --metal \
+  --ssd-streaming \
+  --ssd-streaming-cache-experts 896 \
+  --prefill-chunk 1024 \
+  --ctx 32768 \
+  --nothink
+```
+
+The M4 Pro path automatically uses 18 parallel routed-expert reads; set
+`DS4_METAL_STREAMING_EXPERT_PREAD_THREADS` only for comparative measurements.
+Long streamed prompts use a hybrid prefill schedule whose final 18 tokens seed
+decode-like cache locality. On the 14-core M4 Pro with 24GB RAM, a 16K-token
+slice of this repository's README measured 56.79 prefill tokens/s, 3.82
+generation tokens/s, a 287 ms first decode step, 6.38 GB maximum RSS, 7.92 GB
+peak task footprint, and zero process swaps. A generated Python program passed
+all six adversarial tests used in the adaptation. The q2 quantization is a
+capacity compromise: prefer `--nothink` and verify important answers.
+
+See [`deepseek-flash-m4-pro-24gb.md`](deepseek-flash-m4-pro-24gb.md) for the
+artifact hash, memory accounting, failed hypotheses, filled-context A/B runs,
+and correctness evidence.
+
+Do not combine 1024 experts with a 2K prefill chunk on this machine: that
+measured below 0.3 generation tokens/s under paging pressure. A 1K chunk makes
+1024 legal, but it consumed more memory without beating 896 entries. Use the
+header-only planner before experimenting with cache or context sizes:
+
+```sh
+python3 gguf-tools/model_memory_plan.py ./ds4flash.gguf \
+  --host-memory-gib 24 \
+  --working-set-gib 17.76 \
+  --contexts 32768 \
+  --prefill-chunk 1024 \
+  --expert-cache-count 896
+```
+
 On 64GB MacBooks, start with the 2-bit Flash GGUF and a moderate expert cache:
 
 ```sh

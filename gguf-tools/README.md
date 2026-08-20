@@ -20,6 +20,31 @@ The important pieces are:
 make -C gguf-tools
 ```
 
+## Plan Streaming Memory From A GGUF Header
+
+`model_memory_plan.py` reads the GGUF metadata and tensor directory without
+loading tensor payloads. It reports routed/non-routed bytes and mirrors the
+Laguna or DeepSeek4 runtime geometry for the requested contexts. A complete
+GGUF works directly; an HTTP-range header prefix also works when its
+authoritative object size is passed with `--file-size`.
+
+For the measured 24GB M4 Pro Flash profile:
+
+```sh
+python3 gguf-tools/model_memory_plan.py ./ds4flash.gguf \
+  --host-memory-gib 24 \
+  --working-set-gib 17.76 \
+  --contexts 4096,8192,16384,32768 \
+  --prefill-chunk 1024 \
+  --expert-cache-count 896
+```
+
+`--expert-cache-count N` mirrors the CLI's exact
+`--ssd-streaming-cache-experts N` form. `--expert-budget-gib N` instead mirrors
+the `NGB` form, including the routed-prefill reserve that DS4 subtracts before
+creating dynamic cache entries. Use `--json` for machine-readable output and
+run `make test-memory-plan` for its header/parser and geometry tests.
+
 The quantizer is plain C and does not link GGML.  GGUF metadata handling,
 safetensors loading, FP4/FP8 dequantization, and the quantizers used by our Q2
 and Q4 recipes live in this directory.

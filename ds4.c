@@ -30849,6 +30849,30 @@ static bool metal_graph_use_streaming_decode_prefill_range(
     return metal_graph_use_streaming_decode_prefill(g, weights, n_tokens);
 }
 
+static uint32_t metal_graph_streaming_decode_prefill_tail_tokens(
+        const ds4_gpu_graph *g,
+        const ds4_weights   *weights,
+        uint32_t             n_tokens) {
+    /*
+     * Layer-major prefill is much faster for a long streamed prompt, but its
+     * final expert-access pattern is unlike decode.  On a cache smaller than
+     * the routed experts (notably a 24 GiB unified-memory Mac), beginning
+     * generation directly from that state can turn almost every selected
+     * expert into an SSD miss.  Replaying only the normal short-prefill window
+     * in token-major order makes the cache and LFU route history decode-local
+     * without giving up batched prefill for the long prefix.
+     */
+    if (!g || !g->ssd_streaming || g->quality || n_tokens == 0) return 0;
+    if (glm_graph_env_present(
+                "DS4_ROCM_DISABLE_STREAMING_DECODE_PREFILL_TAIL",
+                "DS4_METAL_DISABLE_STREAMING_DECODE_PREFILL_TAIL")) {
+        return 0;
+    }
+    const uint32_t max_tokens =
+        metal_graph_streaming_decode_prefill_max_tokens(g, weights);
+    return max_tokens != 0 && n_tokens > max_tokens ? max_tokens : 0;
+}
+
 static bool metal_graph_prefill_decode_streaming_range(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -35149,6 +35173,42 @@ static bool metal_graph_prefill_raw_swa(
                                                           cancel_ud,
                                                           cancelled);
     }
+
+    const uint32_t decode_tail =
+        metal_graph_streaming_decode_prefill_tail_tokens(
+                g, weights, (uint32_t)n_tokens);
+    if (decode_tail != 0) {
+        const uint32_t prefix = (uint32_t)n_tokens - decode_tail;
+        bool ok = metal_graph_prefill_layer_major(g,
+                                                   model,
+                                                   weights,
+                                                   prompt,
+                                                   0,
+                                                   prefix,
+                                                   NULL,
+                                                   show_progress,
+                                                   NULL,
+                                                   display_progress,
+                                                   display_progress_ud);
+        if (!ok) return false;
+
+        ds4_gpu_stream_expert_cache_reset_route_hotness();
+        return metal_graph_prefill_decode_streaming_range(g,
+                                                          model,
+                                                          weights,
+                                                          prompt,
+                                                          prefix,
+                                                          decode_tail,
+                                                          logits,
+                                                          show_progress,
+                                                          NULL,
+                                                          NULL,
+                                                          display_progress,
+                                                          display_progress_ud,
+                                                          cancel,
+                                                          cancel_ud,
+                                                          cancelled);
+    }
     /* The layer-major fallback below may submit the whole short prefill as one
      * Metal command buffer.  Once that command is in flight there is no useful
      * safe prefix to expose: by the time cancellation can be observed again,
@@ -35204,21 +35264,22 @@ static bool metal_graph_prefill_chunked_range(
     if (!imatrix &&
         metal_graph_use_streaming_decode_prefill_range(g, weights,
                                                        start, n_tokens)) {
-        return metal_graph_prefill_decode_streaming_range(g,
-                                                          model,
-                                                          weights,
-                                                          prompt,
-                                                          start,
-                                                          n_tokens,
-                                                          logits,
-                                                          show_progress,
-                                                          progress,
-                                                          progress_ud,
-                                                          display_progress,
-                                                          display_progress_ud,
-                                                          cancel,
-                                                          cancel_ud,
-                                                          cancelled);
+        return metal_graph_prefill_decode_streaming_range(
+                g,
+                model,
+                weights,
+                prompt,
+                start,
+                n_tokens,
+                logits,
+                show_progress,
+                progress,
+                progress_ud,
+                display_progress,
+                display_progress_ud,
+                cancel,
+                cancel_ud,
+                cancelled);
     }
 
     uint32_t chunk_cap = g->prefill_cap;
@@ -35230,6 +35291,10 @@ static bool metal_graph_prefill_chunked_range(
                               "DS4_METAL_GRAPH_PREFILL_PROFILE");
     const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
+    const uint32_t decode_tail = !imatrix
+        ? metal_graph_streaming_decode_prefill_tail_tokens(g, weights, n_tokens)
+        : 0;
+    const uint32_t batch_end = end - decode_tail;
 
     if (progress) {
         progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
@@ -35238,12 +35303,12 @@ static bool metal_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
-    for (uint32_t pos0 = start; pos0 < end; ) {
+    for (uint32_t pos0 = start; pos0 < batch_end; ) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
             return true;
         }
-        const uint32_t remaining = end - pos0;
+        const uint32_t remaining = batch_end - pos0;
         uint32_t local_cap = chunk_cap;
         if (start != 0 && g->prefill_cap != 0) {
             const uint32_t mod = pos0 % g->prefill_cap;
@@ -35254,7 +35319,8 @@ static bool metal_graph_prefill_chunked_range(
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
-        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        float *chunk_logits =
+            (progress || (decode_tail == 0 && chunk_end == end)) ? logits : NULL;
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
@@ -35283,6 +35349,27 @@ static bool metal_graph_prefill_chunked_range(
             return true;
         }
         pos0 = chunk_end;
+    }
+
+    if (decode_tail != 0) {
+        ds4_gpu_stream_expert_cache_reset_route_hotness();
+        if (!metal_graph_prefill_decode_streaming_range(g,
+                                                        model,
+                                                        weights,
+                                                        prompt,
+                                                        batch_end,
+                                                        decode_tail,
+                                                        logits,
+                                                        show_progress,
+                                                        progress,
+                                                        progress_ud,
+                                                        display_progress,
+                                                        display_progress_ud,
+                                                        cancel,
+                                                        cancel_ud,
+                                                        cancelled)) {
+            return false;
+        }
     }
     if (show_progress) fputc('\n', stderr);
     if (profile) {
