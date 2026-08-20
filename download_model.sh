@@ -119,10 +119,10 @@ Targets:
        residency.
 
   laguna-q2-q3
-       Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed
+       Mixed Laguna S 2.1 routed-expert quant. Routed
        layers 1..20 use Q2_K and layers 21..47 use Q3_K; all other tensors
-       retain the official Q4_K_M layout. 44.95 GiB on disk; supported by
-       Metal, CUDA, and ROCm with full model residency.
+       retain the official Q4_K_M layout. 44.95 GiB on disk; supported with
+       full residency on Metal/CUDA/ROCm and SSD streaming on Metal.
 
   laguna-dflash
        Q8_0 Laguna S 2.1 DFlash speculative support GGUF, quantized from
@@ -150,9 +150,10 @@ After downloading mtp, enable it explicitly, for example:
 After downloading DSpark support, enable it explicitly in greedy mode:
   ./ds4 --dspark --mtp <download directory>/$DSPARK_SUPPORT_FILE --temp 0
 
-Large PRO, GLM, and Laguna files use the official Hugging Face downloader
-because they are too large, sharded, or nested for the curl path used by the
-smaller DeepSeek Flash GGUF files.
+Large PRO, GLM, Laguna Q4, and Laguna DFlash files use the official Hugging
+Face downloader because they are sharded, nested, or published at pinned
+revisions. The mixed Laguna Q2_K/Q3_K target uses resumable curl so it also
+works on a stock macOS install without the Hugging Face CLI.
 EOF
 }
 
@@ -215,7 +216,6 @@ case "$MODEL" in
     laguna-q2-q3)
         REPO=$LAGUNA_ANTIREZ_REPO
         MODEL_FILE=$LAGUNA_Q2_Q3_FILE
-        FORCE_HF_DOWNLOAD=1
         ;;
     laguna-dflash)
         REPO=$LAGUNA_ANTIREZ_REPO

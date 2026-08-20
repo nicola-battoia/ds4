@@ -905,6 +905,80 @@ kernel void kernel_glm_q3_K_pair_swiglu_f32(
     (void)scratch;
 }
 
+/* Address-table variant used by the SSD expert cache.  The table contains
+ * one base address per model expert, so mixed Q2_K/Q3_K Laguna layers can use
+ * the same bounded cache without materializing a full routed tensor. */
+kernel void kernel_glm_q3_K_addr_pair_swiglu_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const uint64_t *gate_addrs,
+        device const uint64_t *up_addrs,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const uint row0 =
+        ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * N_R0_Q3_K;
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (row0 >= args.mid_dim ||
+        slot >= args.n_expert_used ||
+        token >= args.n_tokens) {
+        return;
+    }
+
+    const uint64_t selected_off =
+        (uint64_t)token * args.n_expert_used + slot;
+    const uint64_t mid_base =
+        (uint64_t)token * args.mid_token_stride +
+        (uint64_t)slot * args.mid_dim;
+    const int expert = selected[selected_off];
+    const bool valid =
+        expert >= 0 && (uint)expert < args.n_total_expert &&
+        gate_addrs[(uint)expert] != 0 && up_addrs[(uint)expert] != 0;
+    if (!valid) {
+        if (tiisg == 0u) {
+            for (short row = 0;
+                 row < N_R0_Q3_K && row0 + (uint)row < args.mid_dim;
+                 row++) {
+                mid[mid_base + row0 + (uint)row] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    device const char *gate =
+        reinterpret_cast<device const char *>(gate_addrs[(uint)expert]);
+    device const char *up =
+        reinterpret_cast<device const char *>(up_addrs[(uint)expert]);
+    const uint64_t gate_base = (uint64_t)row0 * args.gate_row_bytes;
+    const uint64_t up_base = (uint64_t)row0 * args.up_row_bytes;
+    device const float *token_x =
+        x + (uint64_t)token * args.in_dim;
+    float2 gate_dot = ds4_glm_q3_K_dot2(
+        gate + gate_base, args.gate_row_bytes, args.in_dim, token_x, tiisg);
+    float2 up_dot = ds4_glm_q3_K_dot2(
+        up + up_base, args.up_row_bytes, args.in_dim, token_x, tiisg);
+
+    for (short row = 0;
+         row < N_R0_Q3_K && row0 + (uint)row < args.mid_dim;
+         row++) {
+        const float g = simd_sum(gate_dot[row]);
+        const float u = simd_sum(up_dot[row]);
+        if (tiisg == 0u) {
+            const float sw = g / (1.0f + exp(-g));
+            mid[mid_base + row0 + (uint)row] =
+                sw * u * weights[selected_off];
+        }
+    }
+
+    (void)scratch;
+}
+
 kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const uint64_t *gate_addrs,
@@ -2123,6 +2197,56 @@ kernel void kernel_glm_q3_K_down_f32(
             mid + mid_base + (uint64_t)slot * args.mid_dim;
         sum += ds4_glm_q3_K_dot2(
             down + down_base,
+            args.down_row_bytes,
+            args.mid_dim,
+            slot_mid,
+            tiisg);
+    }
+
+    for (short row = 0;
+         row < N_R0_Q3_K && row0 + (uint)row < args.out_dim;
+         row++) {
+        const float value = simd_sum(sum[row]);
+        if (tiisg == 0u) {
+            out[(uint64_t)token * args.out_dim + row0 + (uint)row] = value;
+        }
+    }
+
+    (void)scratch;
+}
+
+kernel void kernel_glm_q3_K_addr_down_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const uint64_t *down_addrs,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const uint row0 =
+        ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * N_R0_Q3_K;
+    const uint token = tgpig.y;
+    if (row0 >= args.out_dim || token >= args.n_tokens) return;
+
+    const uint64_t selected_base =
+        (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_base =
+        (uint64_t)token * args.mid_token_stride;
+    float2 sum = {0.0f, 0.0f};
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const int expert = selected[selected_base + slot];
+        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        const uint64_t down_addr = down_addrs[(uint)expert];
+        if (down_addr == 0) continue;
+        device const char *down =
+            reinterpret_cast<device const char *>(down_addr);
+        device const float *slot_mid =
+            mid + mid_base + (uint64_t)slot * args.mid_dim;
+        sum += ds4_glm_q3_K_dot2(
+            down + (uint64_t)row0 * args.down_row_bytes,
             args.down_row_bytes,
             args.mid_dim,
             slot_mid,

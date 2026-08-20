@@ -218,12 +218,14 @@ static id<MTLComputePipelineState> g_glm_q2_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_mapped_f32_pipeline;
@@ -507,7 +509,7 @@ static int g_initialized;
 static int g_quality_mode;
 static int g_tensor_matmul_suppressed;
 static int g_mpp_invalid_env_reported;
-#define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
+#define DS4_METAL_MAX_ROUTED_EXPERT_USED 16
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
@@ -3652,11 +3654,10 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     /*
-     * Pre-seed the cache's single slab size class with the model's uniform
-     * per-expert bytes (first routed layer). With a mixed-precision GGUF this
-     * pins the class to the majority layers so the boosted ones are rejected
-     * deterministically from startup, instead of depending on which layer
-     * happens to touch the cache first.
+     * Pre-seed the single slab's per-slot capacity.  A normal model passes its
+     * uniform/first routed class, preserving deterministic rejection of larger
+     * boosted layers.  A model with intentionally mixed routed bands may pass
+     * its maximum class so smaller experts safely reuse the same slots.
      */
     g_stream_expert_cache_expert_bytes = bytes;
 }
@@ -7922,6 +7923,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q2_K_addr_pair_swiglu2_f32");
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_addr_pair_swiglu2_f32_masked");
+        g_glm_q3_k_addr_pair_swiglu_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_addr_pair_swiglu_f32");
         g_glm_q4_k_addr_pair_swiglu_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_pair_swiglu_f32");
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline =
@@ -7934,6 +7937,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32");
         g_glm_q2_k_addr_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_addr_down_f32");
+        g_glm_q3_k_addr_down_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_addr_down_f32");
         g_glm_q4_k_addr_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_addr_down_simd_f32");
         g_glm_q5_k_pair_swiglu_f32_pipeline =
@@ -8032,12 +8037,14 @@ int ds4_gpu_init(void) {
             !g_glm_q3_k_pair_swiglu_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_f32_pipeline ||
             !g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline ||
+            !g_glm_q3_k_addr_pair_swiglu_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_f32_pipeline ||
             !g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline ||
             !g_glm_q2_k_down_f32_pipeline ||
             !g_glm_q3_k_down_f32_pipeline ||
             !g_glm_q4_k_down_f32_pipeline ||
             !g_glm_q2_k_addr_down_f32_pipeline ||
+            !g_glm_q3_k_addr_down_f32_pipeline ||
             !g_glm_q4_k_addr_down_f32_pipeline ||
             !g_glm_q5_k_pair_swiglu_f32_pipeline ||
             !g_glm_q5_k_pair_swiglu_mapped_f32_pipeline ||
@@ -9432,12 +9439,14 @@ void ds4_gpu_cleanup(void) {
         g_glm_q3_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline = nil;
+        g_glm_q3_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline = nil;
         g_glm_q2_k_down_f32_pipeline = nil;
         g_glm_q3_k_down_f32_pipeline = nil;
         g_glm_q4_k_down_f32_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
+        g_glm_q3_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_mapped_f32_pipeline = nil;
@@ -10749,20 +10758,17 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         fprintf(stderr, "ds4: Metal streaming expert cache byte size overflow\n");
         return 0;
     }
-    /*
-     * The cache is a single-size-class slab allocator: the expert byte size is
-     * frozen on first sight (or pre-seeded at startup from the model's slab
-     * class) and off-size layers are REJECTED rather than adopted. A rejected
-     * layer (mixed-precision boost: Q4_K experts among IQ2 layers) falls back
-     * to the mapped-model per-expert path; last-writer-wins here would instead
-     * poison the slab size class and deadlock slab reuse.
-     */
+    /* The configured size is the slab-slot capacity.  Ordinary mixed-boost
+     * models still seed it with their first/normal class, so larger boosted
+     * layers keep falling back to mapped views.  Laguna seeds it with its
+     * largest routed class, allowing its smaller Q2_K and larger Q3_K bands to
+     * share one conservative slot geometry. */
     const uint64_t bytes = gate_expert_bytes * 2ull + down_expert_bytes;
     if (g_stream_expert_cache_expert_bytes == 0) {
         g_stream_expert_cache_expert_bytes = bytes;
         return 1;
     }
-    return bytes == g_stream_expert_cache_expert_bytes;
+    return bytes <= g_stream_expert_cache_expert_bytes;
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
@@ -11584,8 +11590,14 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         return 0;
     }
 
-    uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
-    if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
+    const uint64_t logical_bytes =
+        gate_expert_bytes * 2ull + down_expert_bytes;
+    uint64_t slot_bytes = g_stream_expert_cache_expert_bytes != 0 ?
+        g_stream_expert_cache_expert_bytes : logical_bytes;
+    if (logical_bytes == 0 || logical_bytes > slot_bytes ||
+        slot_bytes > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
     const uint64_t page = (uint64_t)getpagesize();
     if (page != 0) {
         slot_bytes = round_up_u64(slot_bytes, page);
@@ -34692,6 +34704,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
 
         const BOOL gate_pair_q2 = gate_type == DS4_METAL_TENSOR_Q2_K;
         const BOOL gate_pair_q3 = gate_type == DS4_METAL_TENSOR_Q3_K;
+        const BOOL gate_pair_q4 = gate_type == DS4_METAL_TENSOR_Q4_K;
         const BOOL gate_pair_q5 = gate_type == DS4_METAL_TENSOR_Q5_K;
         const BOOL down_scalar_q2 = down_type == DS4_METAL_TENSOR_Q2_K;
         const BOOL down_simd_q3 = down_type == DS4_METAL_TENSOR_Q3_K;
@@ -34705,31 +34718,34 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             gate_pair_q2 && down_scalar_q2 &&
             g_glm_q2_k_addr_pair_swiglu2_f32_pipeline != nil &&
             g_glm_q2_k_addr_down_f32_pipeline != nil;
+        const BOOL stream_addr_q3 =
+            gate_pair_q3 && down_simd_q3 &&
+            g_glm_q3_k_addr_pair_swiglu_f32_pipeline != nil &&
+            g_glm_q3_k_addr_down_f32_pipeline != nil;
         const BOOL stream_addr_q4 =
-            !gate_pair_q2 && !gate_pair_q5 && down_scalar_q4 &&
+            gate_pair_q4 && down_scalar_q4 &&
             g_glm_q4_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q4_k_addr_down_f32_pipeline != nil;
         BOOL use_stream_expert_addr_table =
             g_ssd_streaming_mode &&
             !force_resident &&
             getenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE") == NULL &&
-            (stream_addr_q2 || stream_addr_q4) &&
+            (stream_addr_q2 || stream_addr_q3 || stream_addr_q4) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
-            n_expert <= 8u &&
+            n_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED &&
             ds4_gpu_stream_expert_cache_configured_budget() >= n_expert &&
             ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                          down_expert_bytes) &&
             ds4_gpu_stream_expert_cache_effective_cap(layer_index,
                                                       n_total_expert,
                                                       n_expert) != 0;
-        int32_t stream_selected_ids[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        ds4_gpu_stream_expert_cache_entry *stream_entries[8] = {
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-        };
-        uint64_t stream_gate_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_up_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        uint64_t stream_down_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int32_t stream_selected_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        ds4_gpu_stream_expert_cache_entry
+            *stream_entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {NULL};
+        uint64_t stream_gate_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_up_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+        uint64_t stream_down_abs_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
         uint32_t stream_missing_mask = 0;
         uint32_t stream_entry_count = 0;
         uint32_t stream_resident_mask = 0;
@@ -34849,7 +34865,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                     ds4_gpu_stream_expert_split_ready() &&
                     ((gate_pair_q2 &&
                       g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline != nil) ||
-                     (!gate_pair_q2 && !gate_pair_q5 &&
+                     (gate_pair_q4 &&
                       g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline != nil));
                 if (use_stream_split_deferred) {
                     const ds4_gpu_stream_expert_table table = {
@@ -34972,6 +34988,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              (gate_pair_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q2_K_addr_pair_swiglu2_f32") :
+              gate_pair_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_pair_swiglu_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_pair_swiglu_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_pair_swiglu_f32_pipeline,
                                    "kernel_glm_q4_K_addr_pair_swiglu_f32")) :
              gate_pair_q2 ?
@@ -34990,6 +35009,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              (down_scalar_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_down_f32_pipeline,
                                    "kernel_glm_q2_K_addr_down_f32") :
+              down_simd_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_down_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_down_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_down_f32_pipeline,
                                    "kernel_glm_q4_K_addr_down_f32")) :
              down_scalar_q2 ?
@@ -35023,6 +35045,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const char *glm_pair_path =
             use_stream_expert_addr_table ?
             (gate_pair_q2 ? "q2_stream_addr_swiglu" :
+             gate_pair_q3 ? "q3_stream_addr_swiglu" :
                             "q4_stream_addr_swiglu") :
             gate_pair_q2 ? "q2_scalar_swiglu" :
             gate_pair_q3 ? "q3_pair_simd_swiglu" :
@@ -35030,6 +35053,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const char *glm_down_path =
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" :
+             down_simd_q3 ? "q3_stream_addr_down" :
                               "q4_stream_addr_down_simd") :
             down_scalar_q2 ? "q2_down_simd" :
             down_simd_q3 ? "q3_down_simd" :

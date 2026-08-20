@@ -188,6 +188,38 @@ systems. The current Q8_0-signal Q4_K_M and mixed Q2_K/Q3_K layouts run on
 Metal, CUDA, and ROCm. Linux validation covers NVIDIA GB10 in DGX Spark and the
 Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) in Strix Halo.
 
+On 24 GB Apple Silicon, the mixed Q2_K/Q3_K model can instead use Metal SSD
+streaming. Laguna prefill becomes token-major, so its graph allocates one row
+of scratch and every routed layer loads only the 10 selected experts. The cache
+uses Q3-sized slots for both routed quantization bands. Automatic cache sizing
+reads Metal's recommended working set, accounts for the requested context, and
+caps Laguna's cache at one sixth of physical unified memory so macOS and other
+applications retain headroom. On a 24 GiB Mac this is a 4 GiB cache and plans
+8.52 GiB total at 8K or 9.64 GiB at 32K:
+
+```sh
+./download_model.sh laguna-q2-q3
+make -j8
+./ds4 --metal --ssd-streaming \
+  -m gguf/laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf \
+  -c 8192 -p "Explain this repository" --temp 0
+```
+
+On the 24 GiB M4 Pro used for this path, a complete 76-input/116-output coding
+run at 32K context reached 3.81 input tokens/s and 4.03 generation tokens/s
+with the 4 GiB cache. Maximum RSS was 3.59 GiB, peak task footprint was 5.70
+GiB, and the process reported zero swaps. An 839-token repository prompt ran at
+3.67 input tokens/s, and a short decode reached 5.55 tokens/s. 32K is the tested
+working recommendation; larger contexts may satisfy the allocation planner but
+have not received the same sustained validation.
+
+`--ssd-streaming-cache-experts NGB` can override the automatic cache, but a
+larger override may force system-wide swap on a 24 GiB Mac. DFlash, distributed
+execution, tensor parallelism, and non-Metal Laguna SSD streaming are
+intentionally rejected. Use `gguf-tools/model_memory_plan.py MODEL
+--working-set-gib N --host-memory-gib N` to inspect the static, KV, scratch,
+and expert-cache plan without loading the inference graph.
+
 CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
 tagged tool-call formats:
 

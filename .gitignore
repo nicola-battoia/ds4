@@ -31,5 +31,6 @@
 __pycache__/
 *.pyc
 /misc/
+/tools/metal-memory-probe
 .*.swp
 .DS_Store

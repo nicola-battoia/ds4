@@ -4,6 +4,9 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#ifdef __APPLE__
+#include <sys/mman.h>
+#endif
 
 bool ds4_test_dspark_cache_window_crop(void);
 
@@ -5787,6 +5790,267 @@ static void test_dflash_capture_nonfinite_sanitize(void) {
     ds4_gpu_tensor_free(dst);
 }
 
+#ifdef __APPLE__
+typedef struct {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+} test_metal_block_q2_K;
+
+typedef struct {
+    uint8_t hmask[32];
+    uint8_t qs[64];
+    uint8_t scales[12];
+    uint16_t d;
+} test_metal_block_q3_K;
+
+static void test_metal_fill_q2_experts(
+        test_metal_block_q2_K *blocks,
+        uint32_t               n_expert,
+        uint32_t               n_rows,
+        uint8_t                seed) {
+    for (uint32_t expert = 0; expert < n_expert; expert++) {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            test_metal_block_q2_K *block =
+                blocks + (uint64_t)expert * n_rows + row;
+            memset(block, 0, sizeof(*block));
+            block->d = (uint16_t)((7u + ((expert + row) & 1u)) << 10u);
+            block->dmin = (uint16_t)(5u << 10u);
+            memset(block->scales,
+                   (int)(0x11u + ((expert + row + seed) & 3u)),
+                   sizeof(block->scales));
+            const uint8_t q = (uint8_t)((seed + expert + row) & 3u);
+            memset(block->qs,
+                   (int)(q | (q << 2u) | (q << 4u) | (q << 6u)),
+                   sizeof(block->qs));
+        }
+    }
+}
+
+static void test_metal_fill_q3_experts(
+        test_metal_block_q3_K *blocks,
+        uint32_t               n_expert,
+        uint32_t               n_rows,
+        uint8_t                seed) {
+    for (uint32_t expert = 0; expert < n_expert; expert++) {
+        for (uint32_t row = 0; row < n_rows; row++) {
+            test_metal_block_q3_K *block =
+                blocks + (uint64_t)expert * n_rows + row;
+            memset(block, 0, sizeof(*block));
+            block->d = (uint16_t)((7u + ((expert + row) & 1u)) << 10u);
+            memset(block->hmask, 0xff, sizeof(block->hmask));
+            memset(block->scales, 0x11, 8u);
+            memset(block->scales + 8u, 0xaa, 4u);
+            const uint8_t q = (uint8_t)((seed + expert + row) & 3u);
+            memset(block->qs,
+                   (int)(q | (q << 2u) | (q << 4u) | (q << 6u)),
+                   sizeof(block->qs));
+        }
+    }
+}
+
+static void test_metal_laguna_mixed_streaming_selected10_exact(void) {
+    const uint32_t n_total = 12u;
+    const uint32_t n_selected = 10u;
+    const uint32_t dim = 256u;
+    const uint64_t q2_row_bytes = sizeof(test_metal_block_q2_K);
+    const uint64_t q3_row_bytes = sizeof(test_metal_block_q3_K);
+    const uint64_t q2_expert_bytes = (uint64_t)dim * q2_row_bytes;
+    const uint64_t q3_expert_bytes = (uint64_t)dim * q3_row_bytes;
+    const uint64_t q2_tensor_bytes = (uint64_t)n_total * q2_expert_bytes;
+    const uint64_t q3_tensor_bytes = (uint64_t)n_total * q3_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t q2_gate_offset = 0;
+    const uint64_t q2_up_offset = test_round_up_u64(q2_tensor_bytes, page);
+    const uint64_t q2_down_offset =
+        test_round_up_u64(q2_up_offset + q2_tensor_bytes, page);
+    const uint64_t q3_gate_offset =
+        test_round_up_u64(q2_down_offset + q2_tensor_bytes, page);
+    const uint64_t q3_up_offset =
+        test_round_up_u64(q3_gate_offset + q3_tensor_bytes, page);
+    const uint64_t q3_down_offset =
+        test_round_up_u64(q3_up_offset + q3_tensor_bytes, page);
+    const uint64_t model_size =
+        test_round_up_u64(q3_down_offset + q3_tensor_bytes, page);
+    char path[] = "/tmp/ds4-metal-mixed-stream-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(sizeof(test_metal_block_q2_K) == 84u);
+    TEST_ASSERT(sizeof(test_metal_block_q3_K) == 110u);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    TEST_ASSERT(ftruncate(fd, (off_t)model_size) == 0);
+    void *model = mmap(NULL, (size_t)model_size,
+                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    TEST_ASSERT(model != MAP_FAILED);
+    if (model == MAP_FAILED) {
+        close(fd);
+        unlink(path);
+        return;
+    }
+    memset(model, 0, (size_t)model_size);
+    test_metal_fill_q2_experts(
+        (test_metal_block_q2_K *)((uint8_t *)model + q2_gate_offset),
+        n_total, dim, 1u);
+    test_metal_fill_q2_experts(
+        (test_metal_block_q2_K *)((uint8_t *)model + q2_up_offset),
+        n_total, dim, 2u);
+    test_metal_fill_q2_experts(
+        (test_metal_block_q2_K *)((uint8_t *)model + q2_down_offset),
+        n_total, dim, 3u);
+    test_metal_fill_q3_experts(
+        (test_metal_block_q3_K *)((uint8_t *)model + q3_gate_offset),
+        n_total, dim, 1u);
+    test_metal_fill_q3_experts(
+        (test_metal_block_q3_K *)((uint8_t *)model + q3_up_offset),
+        n_total, dim, 2u);
+    test_metal_fill_q3_experts(
+        (test_metal_block_q3_K *)((uint8_t *)model + q3_down_offset),
+        n_total, dim, 3u);
+    TEST_ASSERT(msync(model, (size_t)model_size, MS_SYNC) == 0);
+    TEST_ASSERT(ds4_gpu_init() != 0);
+    TEST_ASSERT(ds4_gpu_set_model_fd(fd) != 0);
+    TEST_ASSERT(ds4_gpu_set_model_map(model, model_size) != 0);
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)dim * sizeof(float));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc((uint64_t)n_selected * sizeof(int32_t));
+    ds4_gpu_tensor *weights =
+        ds4_gpu_tensor_alloc((uint64_t)n_selected * sizeof(float));
+    ds4_gpu_tensor *resident_mid = ds4_gpu_tensor_alloc(
+        (uint64_t)n_selected * dim * sizeof(float));
+    ds4_gpu_tensor *stream_mid = ds4_gpu_tensor_alloc(
+        (uint64_t)n_selected * dim * sizeof(float));
+    ds4_gpu_tensor *resident_out =
+        ds4_gpu_tensor_alloc((uint64_t)dim * sizeof(float));
+    ds4_gpu_tensor *stream_out =
+        ds4_gpu_tensor_alloc((uint64_t)dim * sizeof(float));
+    float x_host[256];
+    int32_t selected_host[10];
+    float weights_host[10];
+    float q2_resident_host[256];
+    float q3_resident_host[256];
+    float stream_host[256];
+    for (uint32_t i = 0; i < dim; i++) {
+        x_host[i] = 0.03125f + (float)((i * 13u) % 31u) / 256.0f;
+    }
+    for (uint32_t i = 0; i < n_selected; i++) {
+        selected_host[i] = (int32_t)i;
+        weights_host[i] = 1.0f / (float)n_selected;
+    }
+    TEST_ASSERT(x && selected && weights && resident_mid && stream_mid &&
+                resident_out && stream_out);
+    if (x && selected && weights && resident_mid && stream_mid &&
+        resident_out && stream_out) {
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        x, 0, x_host, sizeof(x_host)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        selected, 0, selected_host, sizeof(selected_host)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(
+                        weights, 0, weights_host, sizeof(weights_host)) != 0);
+        ds4_gpu_set_ssd_streaming(false);
+        TEST_ASSERT(ds4_gpu_glm_routed_moe_one_tensor(
+                        resident_out, resident_mid, model, model_size,
+                        q2_gate_offset, q2_up_offset, q2_down_offset,
+                        10u, 10u, 10u,
+                        q2_expert_bytes, q2_row_bytes,
+                        q2_expert_bytes, q2_row_bytes,
+                        q2_expert_bytes, q2_row_bytes,
+                        dim, dim, dim, selected, weights,
+                        n_total, n_selected, 1u, x, true) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        resident_out, 0, q2_resident_host,
+                        sizeof(q2_resident_host)) != 0);
+        TEST_ASSERT(ds4_gpu_glm_routed_moe_one_tensor(
+                        resident_out, resident_mid, model, model_size,
+                        q3_gate_offset, q3_up_offset, q3_down_offset,
+                        11u, 11u, 11u,
+                        q3_expert_bytes, q3_row_bytes,
+                        q3_expert_bytes, q3_row_bytes,
+                        q3_expert_bytes, q3_row_bytes,
+                        dim, dim, dim, selected, weights,
+                        n_total, n_selected, 21u, x, true) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        resident_out, 0, q3_resident_host,
+                        sizeof(q3_resident_host)) != 0);
+
+        ds4_gpu_set_ssd_streaming(true);
+        ds4_gpu_set_streaming_expert_cache_budget(20u);
+        ds4_gpu_set_streaming_expert_cache_expert_bytes(
+            q3_expert_bytes * 3u);
+        TEST_ASSERT(ds4_gpu_glm_routed_moe_one_tensor(
+                        stream_out, stream_mid, model, model_size,
+                        q2_gate_offset, q2_up_offset, q2_down_offset,
+                        10u, 10u, 10u,
+                        q2_expert_bytes, q2_row_bytes,
+                        q2_expert_bytes, q2_row_bytes,
+                        q2_expert_bytes, q2_row_bytes,
+                        dim, dim, dim, selected, weights,
+                        n_total, n_selected, 1u, x, false) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        stream_out, 0, stream_host,
+                        sizeof(stream_host)) != 0);
+        size_t q2_mismatches = 0;
+        float q2_max_abs = 0.0f;
+        for (uint32_t i = 0; i < dim; i++) {
+            if (memcmp(&q2_resident_host[i], &stream_host[i], sizeof(float))) {
+                q2_mismatches++;
+            }
+            const float error = fabsf(q2_resident_host[i] - stream_host[i]);
+            if (error > q2_max_abs) q2_max_abs = error;
+        }
+        TEST_ASSERT(ds4_gpu_stream_expert_cache_current_count() == n_selected);
+
+        TEST_ASSERT(ds4_gpu_glm_routed_moe_one_tensor(
+                        stream_out, stream_mid, model, model_size,
+                        q3_gate_offset, q3_up_offset, q3_down_offset,
+                        11u, 11u, 11u,
+                        q3_expert_bytes, q3_row_bytes,
+                        q3_expert_bytes, q3_row_bytes,
+                        q3_expert_bytes, q3_row_bytes,
+                        dim, dim, dim, selected, weights,
+                        n_total, n_selected, 21u, x, false) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(
+                        stream_out, 0, stream_host,
+                        sizeof(stream_host)) != 0);
+        size_t q3_mismatches = 0;
+        float q3_max_abs = 0.0f;
+        for (uint32_t i = 0; i < dim; i++) {
+            if (memcmp(&q3_resident_host[i], &stream_host[i], sizeof(float))) {
+                q3_mismatches++;
+            }
+            const float error = fabsf(q3_resident_host[i] - stream_host[i]);
+            if (error > q3_max_abs) q3_max_abs = error;
+        }
+        fprintf(stderr,
+                "ds4-test: Laguna mixed Q2/Q3 selected-10 SSD cache exact "
+                "q2_mismatch=%zu/%u q2_max_abs=%g "
+                "q3_mismatch=%zu/%u q3_max_abs=%g cached=%u\n",
+                q2_mismatches, dim, q2_max_abs,
+                q3_mismatches, dim, q3_max_abs,
+                ds4_gpu_stream_expert_cache_current_count());
+        TEST_ASSERT(q2_mismatches == 0u);
+        TEST_ASSERT(q3_mismatches == 0u);
+        TEST_ASSERT(ds4_gpu_stream_expert_cache_current_count() ==
+                    n_selected * 2u);
+    }
+
+    ds4_gpu_tensor_free(stream_out);
+    ds4_gpu_tensor_free(resident_out);
+    ds4_gpu_tensor_free(stream_mid);
+    ds4_gpu_tensor_free(resident_mid);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_set_ssd_streaming(false);
+    ds4_gpu_set_streaming_expert_cache_budget(0);
+    ds4_gpu_cleanup();
+    munmap(model, (size_t)model_size);
+    close(fd);
+    unlink(path);
+}
+#endif
+
 static void test_metal_kernel_group(void) {
     test_dflash_capture_nonfinite_sanitize();
     test_metal_f16_matvec_fast_nr0_4();
@@ -5817,6 +6081,7 @@ static void test_metal_kernel_group(void) {
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
+    test_metal_laguna_mixed_streaming_selected10_exact();
 #endif
 }
 
