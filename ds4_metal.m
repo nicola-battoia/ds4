@@ -1689,6 +1689,46 @@ static void ds4_gpu_model_views_clear(void) {
     g_model_view_count = 0;
 }
 
+static void ds4_gpu_model_views_clear_map(
+        const void *model_map,
+        uint64_t    model_size) {
+    uint32_t dst = 0;
+    for (uint32_t src = 0; src < g_model_view_count; src++) {
+        const bool matches =
+            g_model_views[src].model_map == model_map &&
+            g_model_views[src].model_size == model_size;
+        if (matches) {
+            g_model_views[src].buffer = nil;
+            g_model_views[src].model_map = NULL;
+            g_model_views[src].model_size = 0;
+            g_model_views[src].model_offset = 0;
+            g_model_views[src].bytes = 0;
+            continue;
+        }
+        if (dst != src) {
+            g_model_views[dst].buffer = g_model_views[src].buffer;
+            g_model_views[dst].model_map = g_model_views[src].model_map;
+            g_model_views[dst].model_size = g_model_views[src].model_size;
+            g_model_views[dst].model_offset = g_model_views[src].model_offset;
+            g_model_views[dst].bytes = g_model_views[src].bytes;
+            g_model_views[src].buffer = nil;
+            g_model_views[src].model_map = NULL;
+            g_model_views[src].model_size = 0;
+            g_model_views[src].model_offset = 0;
+            g_model_views[src].bytes = 0;
+        }
+        dst++;
+    }
+    g_model_view_count = dst;
+    if (g_model_map_ptr == model_map && g_model_map_size == model_size) {
+        g_model_map_ptr = NULL;
+        g_model_map_size = 0;
+        g_model_mapped_offset = 0;
+        g_model_mapped_size = 0;
+        g_model_mapped_max_tensor_bytes = 0;
+    }
+}
+
 static void ds4_gpu_model_residency_clear(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -11326,7 +11366,9 @@ int ds4_gpu_set_model_map_spans(
         max_tensor_bytes = ds4_gpu_effective_model_max_tensor_bytes(model_size, max_tensor_bytes);
 
         ds4_gpu_model_residency_clear();
-        ds4_gpu_model_views_clear();
+        /* SSD streaming remaps the main model as its active spans change.
+         * Keep views from a separately mapped DSpark support model alive. */
+        ds4_gpu_model_views_clear_map(model_map, model_size);
 
         uint64_t mapped_total = 0;
         uint64_t first_offset = UINT64_MAX;
@@ -11334,7 +11376,7 @@ int ds4_gpu_set_model_map_spans(
             if (offsets[i] > model_size || sizes[i] == 0 || sizes[i] > model_size - offsets[i]) {
                 fprintf(stderr, "ds4: Metal model span %u is outside the GGUF mapping\n", i);
                 ds4_gpu_model_residency_clear();
-                ds4_gpu_model_views_clear();
+                ds4_gpu_model_views_clear_map(model_map, model_size);
                 return 0;
             }
             if (offsets[i] < first_offset) first_offset = offsets[i];
@@ -11348,13 +11390,13 @@ int ds4_gpu_set_model_map_spans(
                                               true,
                                               &mapped_total)) {
                 ds4_gpu_model_residency_clear();
-                ds4_gpu_model_views_clear();
+                ds4_gpu_model_views_clear_map(model_map, model_size);
                 return 0;
             }
         }
         if (!ds4_gpu_finish_model_views(t0, mapped_total, first_offset)) {
             ds4_gpu_model_residency_clear();
-            ds4_gpu_model_views_clear();
+            ds4_gpu_model_views_clear_map(model_map, model_size);
             return 0;
         }
         g_model_map_ptr = model_map;

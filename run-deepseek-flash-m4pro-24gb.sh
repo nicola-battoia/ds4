@@ -8,6 +8,7 @@ DS4_PROFILE_MODEL="${DS4_MODEL:-./ds4flash.gguf}"
 DS4_PROFILE_CACHE="${DS4_M4PRO_CACHE_EXPERTS:-896}"
 DS4_PROFILE_CTX="${DS4_CTX:-32768}"
 DS4_PROFILE_PREFILL="${DS4_PREFILL_CHUNK:-1024}"
+DS4_PROFILE_DSPARK="${DS4_DSPARK_SUPPORT:-}"
 
 if [[ ! -x ./ds4 ]]; then
     printf '%s\n' 'DS4 is not built; run `make -j8` first.' >&2
@@ -23,6 +24,16 @@ if [[ ! "$DS4_PROFILE_CACHE" =~ ^[1-9][0-9]*$ ]]; then
         "$DS4_PROFILE_CACHE" >&2
     exit 1
 fi
+if [[ -n "$DS4_PROFILE_DSPARK" && ! -f "$DS4_PROFILE_DSPARK" ]]; then
+    printf 'DSpark support model not found: %s\n' "$DS4_PROFILE_DSPARK" >&2
+    printf '%s\n' 'Download it with `./download_model.sh ds4f-dspark`.' >&2
+    exit 1
+fi
+
+DS4_PROFILE_DSPARK_ARGS=()
+if [[ -n "$DS4_PROFILE_DSPARK" ]]; then
+    DS4_PROFILE_DSPARK_ARGS=(--mtp "$DS4_PROFILE_DSPARK" --dspark)
+fi
 
 exec ./ds4 \
     -m "$DS4_PROFILE_MODEL" \
@@ -32,4 +43,5 @@ exec ./ds4 \
     --prefill-chunk "$DS4_PROFILE_PREFILL" \
     --ctx "$DS4_PROFILE_CTX" \
     --nothink \
+    "${DS4_PROFILE_DSPARK_ARGS[@]}" \
     "$@"
