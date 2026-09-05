@@ -171,21 +171,14 @@ make -j8
 ./run-deepseek-flash-m4pro-24gb.sh
 ```
 
-To opt into DSpark speculative decoding, download its checkpoint-matched
-support GGUF and pass its path to the wrapper:
-
-```sh
-./download_model.sh ds4f-dspark
-DS4_DSPARK_SUPPORT=./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
-  ./run-deepseek-flash-m4pro-24gb.sh --temp 0
-```
-
-The support model is about 5.6 GiB and adds memory pressure, so close other
-memory-heavy applications before enabling it. DSpark can speed up predictable
-generation such as code, but it is opt-in and may be slower when few draft
-tokens are accepted. At non-zero temperatures, add `--mtp-exact-sampling` when
-the ordinary target sampling distribution must be preserved; otherwise DS4
-uses the faster opportunistic mode described in the main README.
+DSpark is not supported by this 24GB profile. The main model must use SSD
+streaming here, while the current upstream runtime explicitly rejects
+`--ssd-streaming` together with `--mtp`. An experimental M4 Pro run that lifted
+that guard accepted none of 46 forced draft tokens on the upstream `c_add`
+fixture. In the warm matched 32-token run, ordinary decoding reached 3.29 t/s
+and DSpark reached 0.69 t/s with zero accepted drafts. The wrapper therefore
+rejects `DS4_DSPARK_SUPPORT`; speculative decoding remains for machines that
+can keep the main model resident.
 
 At the `ds4>` prompt, type normally. Useful commands are `/help`, `/nothink`,
 `/think`, `/read FILE`, and `/quit`. For a one-shot prompt:
@@ -207,11 +200,11 @@ python3 gguf-tools/model_memory_plan.py ./ds4flash.gguf \
   --expert-cache-count 896
 ```
 
-The wrapper accepts `DS4_MODEL`, `DS4_CTX`, `DS4_PREFILL_CHUNK`,
-`DS4_M4PRO_CACHE_EXPERTS`, and the optional `DS4_DSPARK_SUPPORT` path. Close
-memory-heavy applications if macOS is already under pressure. A 768-entry
-fallback saves `0.844 GiB`, but diverse prompts past roughly 2K can decode much
-more slowly; it is a pressure fallback, not the recommended working profile.
+The wrapper accepts `DS4_MODEL`, `DS4_CTX`, `DS4_PREFILL_CHUNK`, and
+`DS4_M4PRO_CACHE_EXPERTS`. Close memory-heavy applications if macOS is already
+under pressure. A 768-entry fallback saves `0.844 GiB`, but diverse prompts
+past roughly 2K can decode much more slowly; it is a pressure fallback, not the
+recommended working profile.
 
 ## Rejected alternatives
 

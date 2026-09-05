@@ -57904,19 +57904,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
-        ds4_dspark_summary dspark = {0};
-        e->support_kind =
-            support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
-        if (e->ssd_streaming &&
-            (e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark)) {
-            fprintf(stderr,
-                    "ds4: --ssd-streaming with --mtp is supported only for "
-                    "an explicitly enabled DSpark support model; add --dspark\n");
+        if (e->ssd_streaming) {
+            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        ds4_dspark_summary dspark = {0};
+        e->support_kind =
+            support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
         if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
             if (opt->tp.role != DS4_TP_NONE) {
                 fprintf(stderr,

@@ -24,24 +24,21 @@ if [[ ! "$DS4_PROFILE_CACHE" =~ ^[1-9][0-9]*$ ]]; then
         "$DS4_PROFILE_CACHE" >&2
     exit 1
 fi
-if [[ -n "$DS4_PROFILE_DSPARK" && ! -f "$DS4_PROFILE_DSPARK" ]]; then
-    printf 'DSpark support model not found: %s\n' "$DS4_PROFILE_DSPARK" >&2
-    printf '%s\n' 'Download it with `./download_model.sh ds4f-dspark`.' >&2
+if [[ -n "$DS4_PROFILE_DSPARK" ]]; then
+    printf '%s\n' \
+        'DSpark is not supported by the 24GB SSD-streaming profile.' >&2
+    printf '%s\n' \
+        'Unset DS4_DSPARK_SUPPORT to run ordinary Flash on this machine.' >&2
     exit 1
 fi
 
-DS4_PROFILE_DSPARK_ARGS=()
-if [[ -n "$DS4_PROFILE_DSPARK" ]]; then
-    DS4_PROFILE_DSPARK_ARGS=(--mtp "$DS4_PROFILE_DSPARK" --dspark)
-fi
-
-exec ./ds4 \
-    -m "$DS4_PROFILE_MODEL" \
-    --metal \
-    --ssd-streaming \
-    --ssd-streaming-cache-experts "$DS4_PROFILE_CACHE" \
-    --prefill-chunk "$DS4_PROFILE_PREFILL" \
-    --ctx "$DS4_PROFILE_CTX" \
-    --nothink \
-    "${DS4_PROFILE_DSPARK_ARGS[@]}" \
-    "$@"
+DS4_PROFILE_ARGS=(
+    -m "$DS4_PROFILE_MODEL"
+    --metal
+    --ssd-streaming
+    --ssd-streaming-cache-experts "$DS4_PROFILE_CACHE"
+    --prefill-chunk "$DS4_PROFILE_PREFILL"
+    --ctx "$DS4_PROFILE_CTX"
+    --nothink
+)
+exec ./ds4 "${DS4_PROFILE_ARGS[@]}" "$@"

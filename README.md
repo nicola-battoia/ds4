@@ -227,10 +227,10 @@ GGUF of about 5.6 GiB. It is not a standalone model. Download it once:
 The support file can be used with the 0731 Flash `ds4f-q2`, `ds4f-q2-q4`, and
 `ds4f-q4` models listed above. It is checkpoint-specific
 and must not be paired with an older Flash model. For now **DeepSeek V4 PRO**
-is not supported. On Metal, the main model may be resident or use
-`--ssd-streaming`; the support model still adds its own weights and runtime
-state to the memory requirement. DSpark replaces the legacy one-stage MTP
-support model for that run rather than stacking with it.
+is not supported. The current runtime requires the main model to be resident:
+`--ssd-streaming` remains incompatible with `--mtp`. The support model adds its
+own weights and runtime state to the memory requirement. DSpark replaces the
+legacy one-stage MTP support model for that run rather than stacking with it.
 
 Run it with the normal sampling defaults:
 
@@ -388,17 +388,11 @@ See [`deepseek-flash-m4-pro-24gb.md`](deepseek-flash-m4-pro-24gb.md) for the
 artifact hash, memory accounting, failed hypotheses, filled-context A/B runs,
 and correctness evidence.
 
-The same wrapper can opt into DSpark while keeping the SSD-streaming profile:
-
-```sh
-./download_model.sh ds4f-dspark
-DS4_DSPARK_SUPPORT=./gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
-  ./run-deepseek-flash-m4pro-24gb.sh --temp 0
-```
-
-The support GGUF adds about 5.6 GiB of mapped weights. Close memory-heavy
-applications first, and treat the feature as workload-dependent: predictable
-code is the best candidate, while low-acceptance prompts may be slower.
+Do not add DSpark to this 24GB profile. The main model must use SSD streaming
+on this machine, while DSpark currently requires a resident main model. A live
+M4 Pro test of the unsupported combination accepted none of 46 forced draft
+tokens and was materially slower than ordinary decoding, so the wrapper
+rejects `DS4_DSPARK_SUPPORT` instead of silently selecting a slower path.
 
 Do not combine 1024 experts with a 2K prefill chunk on this machine: that
 measured below 0.3 generation tokens/s under paging pressure. A 1K chunk makes
