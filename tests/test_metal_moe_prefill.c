@@ -66,6 +66,8 @@ static int check_case(const void *model, uint64_t model_size,
     for (int run = 0; run < 3 && ok; run++) {
         if (run == 0) setenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED", "1", 1);
         else unsetenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED");
+        if (run == 0) setenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU", "1", 1);
+        else unsetenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU");
         if (run == 0 && tokens < 32)
             setenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION", "1", 1);
         else unsetenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION");
@@ -79,9 +81,10 @@ static int check_case(const void *model, uint64_t model_size,
             INPUT, MID, OUTPUT, it, wt, EXPERTS, SELECTED, 7.0f,
             xt, 0, tokens, &half_mid, true);
         ok = ok && half_mid == (tokens >= 32);
-        for (int i = 0; i < 5 && ok; i++) {
-            /* Tiny kernels leave unowned intermediates untouched; the fused
-             * down reduction also omits the optional expert output tensor. */
+        for (int i = 2; i < 5 && ok; i++) {
+            /* Fused SwiGLU need not materialize gate/up scratch. Compare its
+             * consumed mid and outputs against the unfused reference instead.
+             * Tiny down reductions also omit the optional expert output. */
             if (tokens <= 4 && i == 3) continue;
             const uint64_t bytes = counts[i] * (i == 2 && half_mid ? sizeof(uint16_t) : sizeof(float));
             ok = ds4_gpu_tensor_read(result[i], 0, actual, bytes);
@@ -112,6 +115,7 @@ static int check_case(const void *model, uint64_t model_size,
     }
 cleanup:
     unsetenv("DS4_METAL_DISABLE_ROUTED_MPP_PACKED");
+    unsetenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU");
     unsetenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION");
     for (int i = 0; i < 5; i++) {
         ds4_gpu_tensor_free(result[i]);
