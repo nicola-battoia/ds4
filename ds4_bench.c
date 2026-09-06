@@ -60,6 +60,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_decode_logits_path;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -303,6 +304,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-decode-logits")) {
+            c.dump_decode_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -394,6 +397,12 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-bench: --dspark cannot be combined with "
                 "--teacher-forced-decode\n");
+        exit(2);
+    }
+    if (c.dspark && c.dump_decode_logits_path) {
+        fprintf(stderr,
+                "ds4-bench: --dump-decode-logits cannot capture intermediate "
+                "DSpark logits\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -530,6 +539,36 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
+    return 0;
+}
+
+/* Native-endian records preserve every float bit for same-machine A/B checks.
+ * The header's byte-order marker lets readers identify the source byte order. */
+static int write_decode_logits(FILE *fp,
+                               ds4_session *session,
+                               float *logits,
+                               int vocab,
+                               int frontier,
+                               int token) {
+    if (!fp) return 0;
+    const size_t row_bytes = (size_t)vocab * sizeof(logits[0]);
+    memset(logits, 0xa5, row_bytes);
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr, "ds4-bench: failed to copy decode logits at position %d\n",
+                ds4_session_pos(session));
+        return 1;
+    }
+    const uint32_t record[] = {
+        (uint32_t)frontier,
+        (uint32_t)ds4_session_pos(session),
+        token < 0 ? UINT32_MAX : (uint32_t)token,
+    };
+    if (fwrite(record, sizeof(record), 1, fp) != 1 ||
+        fwrite(logits, row_bytes, 1, fp) != 1) {
+        fprintf(stderr, "ds4-bench: failed to write decode logits: %s\n",
+                strerror(errno));
+        return 1;
+    }
     return 0;
 }
 
@@ -806,6 +845,32 @@ int main(int argc, char **argv) {
     char err[256];
     int previous = 0;
     int rc = 0;
+    FILE *decode_logits = NULL;
+    float *decode_logit_row = NULL;
+    const int vocab = ds4_engine_vocab_size(engine);
+    if (cfg.dump_decode_logits_path) {
+        decode_logits = fopen(cfg.dump_decode_logits_path, "wb");
+        if (!decode_logits) {
+            fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                    cfg.dump_decode_logits_path, strerror(errno));
+            rc = 1;
+            goto done;
+        }
+        decode_logit_row = malloc((size_t)vocab * sizeof(decode_logit_row[0]));
+        if (!decode_logit_row) {
+            fprintf(stderr, "ds4-bench: failed to allocate decode logit row\n");
+            rc = 1;
+            goto done;
+        }
+        const uint32_t header[] = {UINT32_C(0x01020304), (uint32_t)vocab};
+        if (fwrite("DS4DLOG1", 8, 1, decode_logits) != 1 ||
+            fwrite(header, sizeof(header), 1, decode_logits) != 1) {
+            fprintf(stderr, "ds4-bench: failed to write decode logit header: %s\n",
+                    strerror(errno));
+            rc = 1;
+            goto done;
+        }
+    }
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
         ds4_tokens prefix = {
@@ -842,6 +907,11 @@ int main(int argc, char **argv) {
             rc = 1;
             break;
         }
+        if (write_decode_logits(decode_logits, session, decode_logit_row,
+                                vocab, frontier, -1) != 0) {
+            rc = 1;
+            break;
+        }
 
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
@@ -873,6 +943,7 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        double gen_dump_sec = 0.0;
         int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
@@ -964,6 +1035,19 @@ int main(int argc, char **argv) {
             }
 #endif
             const double token_t1 = bench_now_sec();
+            if (decode_logits) {
+                /* Logit capture is diagnostic work, outside both the per-step
+                 * timer and the aggregate generation interval reported below. */
+                const double dump_t0 = bench_now_sec();
+                const int dump_rc = write_decode_logits(
+                    decode_logits, session, decode_logit_row, vocab,
+                    frontier, token);
+                gen_dump_sec += bench_now_sec() - dump_t0;
+                if (dump_rc != 0) {
+                    rc = 1;
+                    break;
+                }
+            }
             int cycle_tokens = 0;
             for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
                 if (toks[j] == eos) {
@@ -1014,7 +1098,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        const double gen_sec = gen_t1 - gen_t0;
+        const double gen_sec = gen_t1 - gen_t0 - gen_dump_sec;
         const int gen_steady_tokens = gen_done > gen_first_tokens ?
             gen_done - gen_first_tokens : 0;
         fprintf(out,
@@ -1034,6 +1118,13 @@ int main(int argc, char **argv) {
         if (frontier >= cfg.ctx_max) break;
     }
 
+done:
+    if (decode_logits && fclose(decode_logits) != 0) {
+        fprintf(stderr, "ds4-bench: failed to close decode logit file: %s\n",
+                strerror(errno));
+        rc = 1;
+    }
+    free(decode_logit_row);
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);

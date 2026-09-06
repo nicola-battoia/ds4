@@ -27,6 +27,44 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### Exact SSD-streaming decode comparison
+
+Use separate, serial `ds4-bench` processes to compare expert-cache or I/O
+policies. The two-session schedule harness below shares one expert cache, so
+the first session warms the second session's routes and does not represent
+ordinary streaming throughput.
+
+For a 24GB M4 Pro diagnostic capture:
+
+```
+./ds4-bench -m ds4flash.gguf --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 896 --prefill-chunk 1024 \
+  --ctx-alloc 32768 --ctx-start 1024 --ctx-max 1024 \
+  --prompt-file speed-bench/promessi_sposi.txt --gen-tokens 64 \
+  --dump-decode-logits baseline.dlog --csv baseline.csv
+```
+
+Repeat with the candidate implementation and `candidate.dlog`, then use
+`cmp baseline.dlog candidate.dlog` to require bit-identical full-vocabulary
+logits and consumed token IDs. Keep the same model, input, context, prefill,
+and cache settings. A file is complete only when its process exits successfully.
+For throughput measurements, omit the dump and alternate fresh-process order
+in ABBA and BAAB blocks. Logit copying and writes are outside per-step timers
+and subtracted from aggregate generation time, but they still perturb the
+workload. macOS's file cache persists between processes; these are not
+physical-SSD-cold measurements.
+
+The binary dump has a 16-byte header: the eight ASCII bytes `DS4DLOG1`, a
+native-endian `uint32_t` byte-order marker `0x01020304`, and a native-endian
+`uint32_t` vocabulary size. Each following record contains three native-endian
+`uint32_t` values (benchmark frontier, session position, consumed input token
+ID), then exactly `vocab` native-endian IEEE-754 float32 logits. The prefill
+row has input token ID `UINT32_MAX`; subsequent rows follow each decode step.
+Ordinary greedy runs have `gen_tokens + 1` rows per completed frontier;
+teacher-forced runs can stop earlier at EOS. DSpark is unsupported
+because it does not expose every intermediate logit row. Files contain raw
+model output, so keep them with the benchmark's input provenance.
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

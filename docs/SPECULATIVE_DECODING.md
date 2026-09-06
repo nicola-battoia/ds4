@@ -32,9 +32,10 @@ For Vision Experimental, substitute its matching main model and support file.
 Do not mix the two checkpoints. DSpark is not supported for PRO.
 The same flags work in `ds4-agent` and non-batched `ds4-server` requests.
 
-The support file adds about 5.6 GiB of weights plus runtime state. On Metal,
-the main model can be resident or SSD-streamed. DSpark replaces the legacy
-one-stage MTP drafter for that run; the two are not stacked.
+The support file adds about 5.6 GiB of weights plus runtime state. The current
+runtime rejects `--ssd-streaming` with `--mtp-model`, so the main model must
+fit resident. DSpark replaces the legacy one-stage MTP drafter for that run;
+the two are not stacked.
 
 Resident M5 paths batch supported verifier expert rows, including two-Mac TP.
 The scheduler can back off when drafting is unproductive. Defaults select the
