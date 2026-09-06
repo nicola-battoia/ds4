@@ -2,6 +2,17 @@
 
 ## Result
 
+The September 6 upstream revalidation keeps the 896-expert profile below.
+With a filled 16K prefix from `speed-bench/promessi_sposi.txt` and 128 generated
+tokens, unchanged controls measured **4.92–4.98 generation tokens/s**. A
+complete CLI coding task measured **4.50–4.53 tokens/s** and its generated
+function passed seven execution cases. The current investigation, exact-logit
+checks and candidate results are recorded in
+[the investigation journal](m4pro-inference-investigation.md).
+
+The following original profile measurements used different prompts and shorter
+decode probes; they are historical evidence, not a matched speed comparison.
+
 Authentic DeepSeek V4 Flash is usable on the 14-core M4 Pro with 24GB of
 unified memory when its routed experts are streamed from the internal SSD.
 The balanced profile is a 32K allocated context, a 1K prefill chunk, an exact
@@ -58,9 +69,13 @@ floor is `8.197 GiB`:
 All 43 routed layers have the same `1.688 GiB` layout. One expert slot is
 `6.75 MiB`; six experts per layer means one token selects 258 slots, or
 `1.701 GiB` of routed weights. The 896-slot cache covers about 3.47 complete
-token working sets. That extra half-set is essential after a diverse prefill:
-768 entries fell to `0.23` generation tokens/s at 2K, while 896 recovered
-`2.83` tokens/s with the same schedule.
+token working sets. Earlier runs observed `0.23` generation tokens/s with
+768 entries and `2.83` with 896 after 2K prefill. The September revalidation
+did not reproduce a capacity threshold: matched 768/896 runs were both around
+5 tokens/s. System and file-cache state can cause large slowdowns even with
+unchanged settings, so those earlier numbers do not establish a cache-size
+cause. The 896 profile remains the tested balance; larger caches did not
+produce a reliable generation gain in the longer revalidation.
 
 The header-only planner mirrors the complete single-tier Metal graph rather
 than DS4's older startup line, which counts only a subset of graph workspace.
@@ -75,12 +90,11 @@ At 32K context and a 1K prefill chunk it reports:
 | Conservative plan (all non-routed + graph + cache) | 15.571 GiB |
 | 95% Metal working-set guard | 16.872 GiB |
 
-The measured footprint is lower because mmap-backed non-routed views are
-faulted on demand rather than all being simultaneously copied and resident.
-The conservative plan still matters: 1024 entries with a 2K workspace reached
-17.597 GiB, exceeded the guard, and paged badly. Reducing the workspace to 1K
-makes 1024 legal, but a 32-token 4K run stayed at `3.26` tokens/s while raising
-peak footprint to `8.81 GB`; 896 is therefore the better balance.
+Task footprint does not account for the entire mapped/driver working set.
+The conservative plan still matters: 1024 entries with a 2K workspace require
+17.597 GiB and exceed the guard. A 1K workspace puts 1024 entries below the
+guard, but September's matched 128-token comparison found no reliable speed
+gain over 896. The additional memory is not justified by those measurements.
 
 ## Implementation
 
@@ -112,31 +126,32 @@ peak footprint to `8.81 GB`; 896 is therefore the better balance.
 
 ## Authentic benchmark results
 
-All rows use Metal, SSD streaming, 32K allocated context, 18 readers, greedy
-generation, and one model process at a time. Aggregate speed includes the
-first decode step.
+These historical rows use Metal, SSD streaming, 32K allocated context, 18
+readers, greedy generation, and one model process at a time. Aggregate speed
+includes the first decode step. Their short probes do not establish cache-size
+causation; use the longer matched comparisons in the investigation journal.
 
 | Filled context | Chunk | Cache | Schedule | Generated | Prefill | Generation | First decode | Result |
 | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- |
 | 512 | 2K | 768 | hybrid | 16 | 14.60 t/s | 3.72 t/s | 370 ms | Short fill works |
-| 2K | 2K | 768 | hybrid | 8 | 18.36 t/s | 0.23 t/s | 3869 ms | Cache locality cliff |
-| 2K | 2K | 896 | hybrid | 8 | 36.40 t/s | 2.83 t/s | 403 ms | Cache threshold recovered |
+| 2K | 2K | 768 | hybrid | 8 | 18.36 t/s | 0.23 t/s | 3869 ms | Historical slowdown |
+| 2K | 2K | 896 | hybrid | 8 | 36.40 t/s | 2.83 t/s | 403 ms | Historical larger-cache run |
 | 4K | 2K | 896 | no tail | 8 | 80.82 t/s | 0.26 t/s | 4201 ms | Phase rollback fails |
 | 4K | 2K | 896 | hybrid | 16 | 68.62 t/s | 3.23 t/s | 293 ms | Both fixes present |
 | 8K | 2K | 896 | hybrid | 16 | 79.29 t/s | 2.90 t/s | 414 ms | Useful context |
-| 16K README | 1K | 896 | hybrid | 16 | **56.79 t/s** | **3.82 t/s** | **287 ms** | **Recommended** |
+| 16K README | 1K | 896 | hybrid | 16 | **56.79 t/s** | **3.82 t/s** | **287 ms** | Original acceptance |
 
 The earlier short 768-entry/18-reader run generated 96 tokens at `4.04` t/s,
 with a 59.6% hit rate and `0.689 GiB` of routed reads per generated token. It
-was useful for reader-count tuning but did not expose the filled-context cache
-cliff. The final 16K run is the acceptance measurement: `/usr/bin/time -l`
+was useful for early reader-count tuning but did not cover longer generation.
+For the original 16K acceptance measurement, `/usr/bin/time -l`
 reported `6,376,718,336` bytes maximum RSS, `7,921,259,992` bytes peak task
 footprint, and zero process swaps.
 
 System-wide swap is noisier because this was a live desktop with substantial
 pre-existing swap. Earlier 768-entry tuning runs coincided with 0.14--1.15 GiB
-of system-wide change; the final acceptance measurement instead uses the
-process's authoritative zero-swap counter. The cache is mlocked for stable
+of system-wide change. Zero process swaps do not rule out GPU page faults,
+file-cache eviction or pressure on other applications. The cache is mlocked for stable
 Metal latency, so close memory-heavy applications if macOS memory pressure is
 already elevated.
 
@@ -201,10 +216,9 @@ python3 gguf-tools/model_memory_plan.py ./ds4flash.gguf \
 ```
 
 The wrapper accepts `DS4_MODEL`, `DS4_CTX`, `DS4_PREFILL_CHUNK`, and
-`DS4_M4PRO_CACHE_EXPERTS`. Close memory-heavy applications if macOS is already
-under pressure. A 768-entry fallback saves `0.844 GiB`, but diverse prompts
-past roughly 2K can decode much more slowly; it is a pressure fallback, not the
-recommended working profile.
+`DS4_M4PRO_CACHE_EXPERTS`. A 768-entry fallback saves `0.844 GiB`. Current
+matched testing found similar throughput at 768 and 896 entries; keep the
+default unless the smaller footprint is useful for your other applications.
 
 ## Rejected alternatives
 
@@ -215,11 +229,11 @@ recommended working profile.
 - A 4K prefill chunk needs about 4.22 GiB of workspace/state at 32K. A 2K
   chunk lowers that to 2.21 GiB, but the final 1K setting needs only 1.11 GiB
   and leaves substantially more room for the routed cache and macOS.
-- 399 automatic slots and the initially selected 768 slots fit easily but are
-  too small for reliable filled-context routing locality.
-- A 64-token token-major tail did not repair a 4K/768 run (`0.24` t/s) and
-  cut prefill to `11.75` t/s. The successful design needs both a short phase
-  tail and the 896-entry cache, not a longer blind warmup.
-- 1024 entries with the old 2K workspace forced mapped signal weights into
-  paging. With a 1K workspace it no longer pages, but adds memory without
-  improving sustained generation over 896 entries.
+- Smaller caches fit more easily but have not produced a repeatable generation
+  speed gain over the current 896-slot profile.
+- A 64-token token-major tail did not repair an earlier slow 4K/768 run
+  (`0.24` t/s) and cut prefill to `11.75` t/s. The extra prefill cost did not
+  establish a useful generation benefit.
+- 1024 entries with the old 2K workspace exceed the conservative memory guard.
+  A 1K workspace fits that guard, but the longer matched comparison did not
+  show a generation gain over 896 entries.

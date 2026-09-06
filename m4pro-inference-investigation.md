@@ -463,3 +463,330 @@ Do not alter inference arithmetic, cache replacement, global VM settings or
 other applications. First test 512 slots with and without locking, with the
 readiness experiment disabled, exact logits and measured process/system memory.
 Build and run only after the ongoing 16K acceptance completes.
+
+The completed 16K acceptance returned 4.98/4.92 t/s for controls and
+5.16/5.05 for readiness-based splitting (mean +3.1%). All four decoded
+continuations are identical. Together with the unchanged coding throughput,
+this is a small, workload-dependent result, not yet a release default. Keep
+the readiness diagnostic disabled for the dense-lock comparison.
+
+The bounded expert-layout microbenchmark verified all bytes and buffer guards
+with a 486-MiB immediately unlinked sample. Original three-slice versus packed
+one-slice median read times were 0.970/1.386 ms (one expert), 1.411/2.428 ms
+(two), and 3.370/6.713 ms (six). This does not justify a sidecar conversion;
+fewer reads also reduce the available I/O parallelism. The sample is removed.
+
+The first dense-lock run preserved all 129 full-logit rows but returned
+4.99 versus 5.01 t/s, with prefill dropping from 50.65 to 30.60 t/s. The
+diagnostic also locks changing layer views during prefill, creating avoidable
+work before the final 8.20-GiB dense view. Its reverse runs remain pending;
+do not retain this implementation without an actual decode benefit.
+
+## Iteration 9 — scheduling urgency of inference I/O
+
+Source inspection shows the SSD selected-load service and persistent pread
+workers use the inherited/default pthread QoS. Upstream already assigns an
+explicit QoS to its unrelated TP gate service. Apple's
+[Apple silicon performance guide](https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon/)
+recommends classifying work so the scheduler can choose cores appropriately;
+its [pthread QoS guide](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html)
+documents the supported per-thread API.
+
+Plan before editing: after the dense comparison, remove rejected diagnostic
+code and test explicit user-initiated QoS for only the DeepSeek SSD selected
+load service and persistent read workers. Leave the main thread, other apps,
+global scheduler settings, cache geometry and all math unchanged. Use a
+diagnostic flag initially, exact logits in serial 2K ABBA, then normal CLI
+and longer-context acceptance if it helps. This is a scheduling hypothesis,
+not an assumption that the current workers run on efficiency cores.
+
+The dense-lock ABBA finished at 5.01/4.72 t/s for controls and 4.99/4.98
+for locked runs. All four captures match the 2K reference exactly, with zero
+process swaps and no system-swap increase. The candidate's mean +2.5% is
+driven by the slower last control; it adds roughly 27 seconds of prefill
+locking work and does not establish a useful default. Remove both dense-lock
+and readiness diagnostics from the runtime before testing QoS; their patch
+is retained with the ignored experiment artifacts.
+
+## Iteration 10 — start exact hash-routed reads before attention
+
+The early hash-routed layers know their six expert identities directly from
+the input token, but currently initiate their reads after encoding attention
+and the router. The existing helper already reads that exact table on the CPU;
+moving its first call earlier needs no prediction or new routing algorithm.
+
+Plan before editing: add a diagnostic call to that helper at entry to the
+full single-device Flash IQ2 SSD decode layer. Keep the existing later call:
+the pending-load matcher deduplicates the same batch and the override remains
+the same six IDs. This gives reads the CPU's attention-encoding interval as
+additional lead time, without an extra GPU submission or any arithmetic
+change. Exclude other phases, resident/quality/multi-device paths, and profiling.
+Check full logits and fresh-process ABBA throughput after the QoS screen;
+retain only if complete output tests confirm a useful gain.
+
+The QoS screen completed at 5.17/5.14 t/s for controls and 5.13/4.92 for
+explicit user-initiated workers. All four full-logit captures match exactly,
+with zero process swaps. Reject the scheduling change (mean -2.5%) and
+remove it before testing the hash-read timing change. The same existing
+reader pool and its original QoS remain the control.
+
+## Iteration 11 — skip empty cache layers during victim selection
+
+The replacement loops scan all 120 x 256 possible cache entries, although
+Flash has only 43 layers and the cache already maintains exact per-layer
+entry counts. This permits a smaller optimization than introducing a new
+replacement policy or data structure.
+
+Plan before editing: in the single/batch reusable-buffer scans, skip layers
+whose existing entry count is zero. Preserve traversal order, hotness and
+age comparisons, protection, and in-flight retry behavior for every possible
+victim. Initially put it behind one diagnostic flag; compare exact logits
+and full-model throughput with hash timing disabled. Use existing timing
+counters to confirm fewer scans. Also run the existing encoder timeline
+diagnostic on the baseline to identify the remaining GPU and scheduling costs;
+its extra encoder boundaries disqualify its timings as headline throughput.
+
+The earlier-hash-read ABBA returned 4.89/5.18 t/s for controls and
+5.09/5.02 for candidates: mean +0.4%, with exact full logits in every run.
+The first pair's apparent +4% did not survive reverse-order testing. Reject
+this change; the current compiled diagnostic remains disabled while collecting
+the baseline timeline. Remove its source before the cache-scan experiment.
+
+## Iteration 12 — overlap readahead inside the existing reader pool
+
+The baseline encoder timeline preserved all 33 full-logit rows. Its 32 decode
+steps took 7.223 seconds, with 2.254 seconds of measured GPU encoder execution
+(31%). The separate streaming counters, covering the 18-token prefill tail
+plus generation, recorded 3.500 seconds in serial readahead calls versus
+0.132 seconds scanning cache entries. Mean load preparation was 1.890 ms;
+the asynchronous pread interval averaged 2.010 ms. These intervals overlap,
+so they must not be added or treated as pure SSD service time.
+
+Plan before editing: retain the same advisory ranges, but test issuing each
+range's `F_RDADVISE` inside the persistent worker immediately before its
+`pread`. The selected-load service can then publish the batch without waiting
+for every hint in sequence. Keep direct reads, byte counts, cache placement,
+completion barriers and GPU order unchanged. The synchronous fallback uses
+the same read helper. Protect optional hint timing counters because hints can
+now run concurrently, and describe their sum as worker time rather than wall
+time. A diagnostic flag initially restricts this change to DeepSeek SSD.
+Compare against the default and the existing no-readahead option, with empty
+layer skipping disabled, full logits and longer decode probes before acceptance.
+
+The empty-layer scan ABBA returned 5.14/5.04 t/s for controls and 5.20/4.73
+for candidates, with exact logits. Candidate prefill varied from 43.43 to
+20.82 t/s as system swap grew and page faults increased; zero process swaps
+did not capture that system pressure. This does not establish a generation
+benefit. Remove the diagnostic and keep the original victim scan for the
+readahead comparison, so only one timing policy changes.
+
+The actual private reader pool passed 5,000 serial-hint, 5,000 worker-hint
+and 5,000 no-hint batches using a 64-KiB fixture. All bytes, inactive slots
+and guards were exact through changing task/worker counts, immediate task
+reuse and pool restarts. Both hint modes recorded exactly 47,496 hints;
+the no-hint mode recorded zero. Small cached reads were not faster with worker
+hints (585 versus 522 ms), so only full-model results can justify the change.
+
+## Iteration 13 — fuse streamed IQ2 activation in registers
+
+The measured largest GPU kernel is the masked address-table IQ2 gate/up pair.
+Its current implementation writes gate/up rows and immediately rereads them
+to apply SwiGLU, serially on one SIMD lane. The resident ID-based kernel
+already reduces the same dot products into registers and distributes the four
+row activations across four lanes.
+
+Plan before editing: extend the shared IQ2 pair helper with a compile-time
+fused finish, and use it only from the masked address-table entry point. Keep
+the same quantization loop, per-row SIMD reductions, gate/up diagnostic writes,
+clamp and weight multiplication. The ordinary helper instantiation remains
+unchanged. Prepare this in an ignored source copy and select it through the
+repository's existing `DS4_METAL_MOE_SOURCE` override; no new runtime mode is
+needed. Require the repository Metal kernel tests and full-model byte-exact
+logits before longer alternating throughput and complete CLI acceptance.
+Run only after the readahead series finishes.
+
+The six-run hint comparison completed with byte-exact full logits in every
+run. Generation was 5.15/5.36 t/s for the original serial hints, 4.79/4.66
+for worker hints, and 4.67/4.47 without hints. Relative to the control mean,
+worker hints lost 10.1% and no hints lost 13.0%. Keep the original hint order;
+remove the worker diagnostic before the register-fusion experiment. The
+large hint timing counter did not identify work that could simply be removed
+or moved without changing effective SSD service.
+
+The register candidate compiles and passes the generic Metal/MoE regression
+suites, but the first full-model capture differs, including the prefill
+frontier, and eventually chooses different tokens. Stop its throughput series
+immediately; its 4.74 t/s is not an acceptable speed result. Next isolate the
+masked address kernel with identical synthetic weights, inputs, masks and
+poisoned outputs in one process, comparing gate, up and mid separately. This
+will distinguish indexing/reduction mistakes from changed floating-point
+contraction across the removed memory boundary. Preserve release arithmetic;
+do not relax correctness tolerances to accept the candidate.
+
+The isolated shader comparison localizes the drift to activation: gate/up
+are bit-exact for every tested mask and shape, while mid differs by 1–3 ULP.
+Those small differences amplify over the model. Full 4096-by-2048 six-expert
+kernel time is also effectively neutral (210.5 versus 210.4 microseconds in
+this cached synthetic fixture). Reject this register finish; no production
+shader was changed. Keep the focused fixture for subsequent arithmetic tests.
+
+## Iteration 14 — recheck reader concurrency under current upstream
+
+The M4-specific 18-reader default predates the merge and the present, much
+faster machine state. Read-ahead already queues all selected tensor ranges;
+excess synchronous readers could add filesystem and scheduling contention.
+Plan before changing any defaults: use the existing reader-count override
+with 18, 9, 6, 6, 9, 18 workers in separate, serial 2K/128-generation runs.
+Keep the original shader, cache, hint ordering and all other settings. Require
+full-logit equality, then longer generation and CLI acceptance if fewer
+readers show a repeatable benefit. Do not infer a new default from the old
+3.61-to-4.04 t/s measurement alone.
+
+## Iteration 15 — reduce IQ2 lookup overhead without changing activation
+
+The focused fixture now exposes gate/up separately from the streamed activation.
+Two bounded shader candidates can therefore be screened without rerunning a
+large model for every compiler variation. Plan before editing: prepare source
+copies that (A) apply the IQ2 sign to the exactly representable integer grid
+value before multiplying the input, or (B) read the small grid/sign tables from
+constant memory directly, avoiding per-threadgroup copies and their barrier.
+Restrict each copy to the existing shared IQ2 pair helper; preserve its original
+lane-zero writes and the original activation entry point. Compare every bit
+of gate/up/mid, inactive masks and realistic shapes, with repeated alternating
+GPU timings. Only a meaningful exact kernel improvement advances to full-model
+ABBA and CLI tests. Do not run GPU fixtures alongside the reader series.
+
+## Iteration 16 — wake only readers assigned to the batch
+
+Code inspection found that every read batch broadcasts to all pool threads,
+including idle readers outside the requested count. The earlier completion-
+barrier experiment retained that broadcast and therefore did not test this
+cost. Plan before editing: prepare an isolated runtime copy that signals only
+n_workers sleepers and lets any unclaimed worker take one of n_workers leases
+for the current generation. Retain dynamic task claiming and require all leased
+workers to finish before publishing completion. The generation predicate must
+also admit threads that were starting or returning to sleep when signalled,
+so correctness cannot depend on retaining condition-variable signals.
+
+Use the existing mutex, generation, active/remaining counts and shutdown
+broadcast, with no additional pool or thread count. Stress varying batches,
+reader limits, immediate descriptor/task reuse, failed reads and pool restarts
+before any model run. Compare the compiled candidate against the unchanged
+binary, with the original 18-reader cap and shader. Run after reader-count
+screening; source copies remain ignored until end-to-end evidence justifies
+applying a release change.
+
+The reader-count screen completed with exact 2K full-logit captures throughout:
+18 readers returned 4.52/4.46 t/s; nine returned 4.54/5.10; six returned
+4.96/4.97. Six improves the paired control mean by 10.6%. This is the first
+clear matching forward/reverse generation result in the current machine state.
+No default is changed yet. Proceed with six/18/18/six at a filled 4K context
+and 512 generated tokens, comparing the entire 513-row capture. Then use the
+complete CLI code fixture without tracing/capture. If those confirm a benefit,
+check a filled 16K context. Defer the prepared shader and pool-wakeup candidates
+so these acceptance runs isolate the existing reader-count setting.
+
+## Iteration 17 — keep bulk prefill concurrency while limiting decode reads
+
+The six-reader screen reduced prefill from about 47.4 to 40.0 t/s, despite
+its generation gain. That matters for long prompts. Plan before editing:
+combine the prepared selective-wakeup pool with a six-reader cap only in the
+single-token early selected-load entry point, on the 24-GiB M4 Pro. Keep the
+18-reader pool capacity and the existing bulk-prefill reader policy. Preserve
+the existing explicit reader-count override. GLM is outside this experiment.
+
+The pool should retain one broadcast when every reader has a lease, and signal
+only the required number otherwise. This avoids waking unused readers during
+decode while preserving the bulk path. Prepare an isolated candidate binary;
+require the pool stress fixture, exact full-model logits and serial comparisons
+against both original 18-reader behavior and the fixed-six setting. Apply only
+if CLI generation and filled-context runs confirm the gain without moving the
+cost into prompt processing.
+
+Pool review follows the [POSIX condition-variable contract](https://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_broadcast.html):
+a wakeup does not itself grant work. The mutex-protected generation and
+unclaimed-worker predicate bounds admission even with spurious wakeups or
+threads that had not begun waiting when signalled. Completion still waits for
+all admitted workers to release their leases.
+
+Fixed-six 4K/512 BAAB completed: six returned prefill/generation
+44.30/4.66 and 53.86/4.51 t/s; 18 returned 49.48/4.25 and 45.17/4.57.
+All four 513-row captures match SHA-256
+`14ff1378ca19bcfa0b8f1cbb2049b31d356b9f4bad67beb0b1b60fec4c7cf84f`.
+Generation mean improves by 4.0%, but the reverse pair loses 1.3% and prefill
+varies substantially. The earlier 10.6% is therefore a short-screen result,
+not a release claim. Test the phase-specific/selective-wakeup candidate next;
+do not change the global M4 default from these results alone.
+
+The selective-wakeup pool passed 30,000 changing batches at pool limits 6,
+9 and 18, including byte/guard checks, 30 restarts and EOF recovery. Bounded
+fixture times were 541/607/779 ms; these are correctness stress observations,
+not model throughput. The combined candidate build is warning-free.
+
+Both remaining IQ2 lookup candidates were bit-exact in the focused fixture
+but slower at production shape. Integer-sign folding took 307 versus 207 us
+for six experts; constant-table lookup took 210 versus 208 us, and 142 versus
+130 us for a partial mask. Reject both. No production Metal shader has changed.
+
+The combined decode-only/selective-wakeup 2K ABBA returned 5.20/5.21 t/s
+for controls and 5.30/5.31 for candidates: +1.9%, with a 0.10 t/s gain in
+each direction and exact full logits throughout. Prefill means were 48.84 and
+51.48 t/s; whole-run means were 67.27 and 64.86 seconds. This is a modest
+lead, not the fixed-six screen's 10.6% claim.
+
+Next isolate whether the decode cap is needed: compile the selective-wakeup
+pool alone, retaining the original reader limits. Compare original / wake-only /
+decode-cap / decode-cap / wake-only / original through the complete CLI code
+fixture, without logit capture or profiling. Require the same complete source
+output and execution cases. Advance the simplest variant with a repeatable
+end-to-end advantage to longer filled-context acceptance.
+
+## Iteration 18 — screen scan-resistant cache admission offline
+
+The earlier cache simulation assumed mandatory admission and LRU ties. A
+one-off miss can therefore displace an established entry even if it is unlikely
+to recur. Plan before runtime edits: first screen the small equivalent ranking
+change of evicting the most recently inserted entry among equally cold experts,
+while retaining ordinary LRU ties above a low frequency threshold. This can
+make recently loaded one-off experts act as temporary staging slots without
+allocating a second cache. Use the existing recorded real routes, empty and
+hotlist seeds, multiple cold thresholds and the same 16-token decay.
+
+This offline model omits GPU in-flight protection and exact prefill cache
+contents. A large miss reduction would justify a real implementation experiment;
+small or inconsistent savings will not. Run the simulation between model series,
+so CPU work does not contaminate inference measurements.
+
+The cold-MRU route screen found no useful admission shortcut. Threshold zero
+matches current LFU/LRU exactly at 106.37 misses/token; thresholds one and
+two worsen it to 107.58 and 111.22. Empty/hotlist starts converge to the same
+results after the tail. Reject this ranking change without runtime edits.
+
+## Iteration 19 — disable implicit filesystem read-ahead, keep explicit hints
+
+Apple's [file-descriptor implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_descrip.c)
+sets the per-open-file `FNORDAHEAD` flag for `F_RDAHEAD=0`.
+[The vnode read path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_vnops.c)
+passes it as `IO_RAOFF`, and
+[clustered reads](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_cluster.c)
+use it to disable automatic read-ahead. This is distinct from DS4's explicit
+`F_RDADVISE` requests, whose removal already lost performance. Public XNU main
+is explanatory source, not proof of the exact installed kernel revision.
+
+Plan before editing: prepare a baseline runtime copy that sets `F_RDAHEAD=0`
+on the engine's model descriptor only in DeepSeek Metal SSD mode. Retain
+explicit hints, ordinary page caching, all read offsets/lengths, 18-reader
+concurrency, cache policy and GPU code. Log whether the fcntl succeeded.
+The descriptor belongs to this engine and closes with it; this changes neither
+the GGUF nor a system setting. Compare full logits and alternating full-model
+throughput, then CLI/filled context if promising. Do not combine it with the
+worker candidate during this screen. Build/run after the current CLI series.
+
+The six complete CLI responses are byte-identical to the validated code fixture.
+Generation was 4.62/3.84 t/s for controls, 4.54/4.52 for wake-only, and
+4.31/4.66 for wake plus the decode cap. Prefill was 4.68/5.03, 5.23/5.12,
+and 5.10/5.27 respectively. Whole-run seconds were 53.83/59.58, 52.45/52.76,
+and 54.90/51.32. The final control's large slowdown drives apparent mean wins;
+neither candidate beats the first control consistently. Do not ship either
+from this evidence. Keep their isolated binaries for possible follow-up and
+screen automatic read-ahead separately on the original runtime.
